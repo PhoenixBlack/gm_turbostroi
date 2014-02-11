@@ -1,0 +1,6 @@
+[submodule "external/simc"]
+	path = external/simc
+	url = https://github.com/FoxWorks/SIMC
+[submodule "external/garrysmod"]
+	path = external/garrysmod
+	url = https://github.com/garrynewman/gmod-module-base
