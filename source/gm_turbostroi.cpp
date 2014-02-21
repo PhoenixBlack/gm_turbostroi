@@ -212,16 +212,12 @@ void loadLua(lua_State* state, lua_State* L, char* filename) {
 int API_InitializeTrain(lua_State* state) {
 	//if (!LUA->CheckType(1, Type::USERDATA)) return 0;'
 
-	//Add entry for train
-	/*LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
-	LUA->GetField(-1,"Turbostroi");
-	LUA->GetField(-1,"TrainData");
-	LUA->Push(1);
-	LUA->PushString("");
-	LUA->SetTable(-3);
-	LUA->Pop(); //TrainData
-	LUA->Pop(); //Turbostroi
-	LUA->Pop(); //GLOB*/
+	//Get current time
+	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+	LUA->GetField(-1,"CurTime");
+	LUA->Call(0,1);
+	double curtime = LUA->GetNumber(-1);
+	LUA->Pop(2); //Curtime, GLOB
 
 	//Initialize LuaJIT for train
 	lua_State* L  = luaL_newstate();
@@ -281,6 +277,7 @@ int API_InitializeTrain(lua_State* state) {
 	thread_userdata* userdata = (thread_userdata*)malloc(sizeof(thread_userdata));
 	userdata->finished = 0;
 	userdata->L = L;
+	userdata->current_time = curtime;
 	SIMC_Queue_Create(&userdata->thread_to_sim,QUEUE_SIZE,sizeof(thread_msg));
 	SIMC_Queue_Create(&userdata->sim_to_thread,QUEUE_SIZE,sizeof(thread_msg));
 	LUA->PushUserdata(userdata);
@@ -324,26 +321,31 @@ int API_LoadSystem(lua_State* state) {
 	//LUA->Call(1,0);
 	//LUA->Pop();
 
-	strncat(loadSystemsList,LUA->GetString(1),131071);
-	strncat(loadSystemsList,"\n",131071);
-	strncat(loadSystemsList,LUA->GetString(2),131071);
-	strncat(loadSystemsList,"\n",131071);
+	if (LUA->GetString(1) && LUA->GetString(2)) {
+		strncat(loadSystemsList,LUA->GetString(1),131071);
+		strncat(loadSystemsList,"\n",131071);
+		strncat(loadSystemsList,LUA->GetString(2),131071);
+		strncat(loadSystemsList,"\n",131071);
+	}
 	return 0;
 }
 
 int API_RegisterSystem(lua_State* state) {
-	char msg[8192] = { 0 };
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
-	LUA->GetField(-1,"Msg");
-	sprintf(msg,"Metrostroi: Registering system %s [%s]\n",LUA->GetString(1),LUA->GetString(2));
-	LUA->PushString(msg);
-	LUA->Call(1,0);
-	LUA->Pop();
+	if (LUA->GetString(1) && LUA->GetString(2)) {
+		char msg[8192] = { 0 };
+		LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+		LUA->GetField(-1,"Msg");
+		sprintf(msg,"Metrostroi: Registering system %s [%s]\n",LUA->GetString(1),LUA->GetString(2));
+		LUA->PushString(msg);
+		LUA->Call(1,0);
+		LUA->Pop();
 
-	strncat(metrostroiSystemsList,LUA->GetString(1),131071);
-	strncat(metrostroiSystemsList,"\n",131071);
-	strncat(metrostroiSystemsList,LUA->GetString(2),131071);
-	strncat(metrostroiSystemsList,"\n",131071);
+	
+		strncat(metrostroiSystemsList,LUA->GetString(1),131071);
+		strncat(metrostroiSystemsList,"\n",131071);
+		strncat(metrostroiSystemsList,LUA->GetString(2),131071);
+		strncat(metrostroiSystemsList,"\n",131071);
+	}
 	return 0;
 }
 
