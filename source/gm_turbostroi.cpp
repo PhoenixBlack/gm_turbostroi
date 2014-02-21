@@ -16,20 +16,28 @@ extern "C" {
 //------------------------------------------------------------------------------
 // Shared thread printing stuff
 //------------------------------------------------------------------------------
-#define BUFFER_SIZE 1024*1024
+#define BUFFER_SIZE 131072
+#define QUEUE_SIZE 32768
 double target_time = 0.0;
 double rate = 100.0; //FPS
 char metrostroiSystemsList[BUFFER_SIZE] = { 0 };
 char loadSystemsList[BUFFER_SIZE] = { 0 };
 
 typedef struct {
+	int message;
+	char system_name[64];
+	char name[64];
+	double index;
+	double value;
+} thread_msg;
+
+typedef struct {
 	double current_time;
 	lua_State* L;
 	int finished;
 
-	SIMC_LOCK_ID readWriteLock;
-	char readData[BUFFER_SIZE];
-	char writeData[BUFFER_SIZE];
+	SIMC_QUEUE* thread_to_sim;
+	SIMC_QUEUE* sim_to_thread;
 } thread_userdata;
 
 char printMessageBuf[BUFFER_SIZE] = { 0 };
@@ -65,7 +73,58 @@ int shared_print(lua_State* L) {
 	return 0;
 }
 
+int thread_sendmessage(lua_State* state) {
+	luaL_checktype(state,1,LUA_TNUMBER);
+	luaL_checktype(state,2,LUA_TSTRING);
+	luaL_checktype(state,3,LUA_TSTRING);
+	luaL_checktype(state,4,LUA_TNUMBER);
+	luaL_checktype(state,5,LUA_TNUMBER);
 
+	lua_getglobal(state,"_userdata");
+	thread_userdata* userdata = (thread_userdata*)lua_touserdata(state,-1);
+	lua_pop(state,1);
+
+	if (userdata) {
+		thread_msg* tmsg;
+		SIMC_Queue_EnterWrite(userdata->thread_to_sim,(void**)&tmsg);
+			tmsg->message = (int)lua_tonumber(state,1);
+			strncpy(tmsg->system_name,lua_tostring(state,2),63);
+			tmsg->system_name[63] = 0;
+			strncpy(tmsg->name,lua_tostring(state,3),63);
+			tmsg->name[63] = 0;
+			tmsg->index = lua_tonumber(state,4);
+			tmsg->value = lua_tonumber(state,5);
+		SIMC_Queue_LeaveWrite(userdata->thread_to_sim);
+	}
+	return 0;
+}
+
+int thread_recvmessage(lua_State* state) {
+	lua_getglobal(state,"_userdata");
+	thread_userdata* userdata = (thread_userdata*)lua_touserdata(state,-1);
+	lua_pop(state,1);
+
+	if (userdata) {
+		thread_msg* tmsg;
+		if (SIMC_Queue_EnterRead(userdata->sim_to_thread,(void**)&tmsg)) {
+			lua_pushnumber(state,tmsg->message);
+			lua_pushstring(state,tmsg->system_name);
+			lua_pushstring(state,tmsg->name);
+			lua_pushnumber(state,tmsg->index);
+			lua_pushnumber(state,tmsg->value);
+			SIMC_Queue_LeaveRead(userdata->sim_to_thread);
+			return 5;
+		}		
+	}
+	return 0;
+}
+
+
+
+
+//------------------------------------------------------------------------------
+// Simulation thread
+//------------------------------------------------------------------------------
 void threadSimulation(thread_userdata* userdata) {
 	lua_State* L = userdata->L;
 
@@ -81,27 +140,7 @@ void threadSimulation(thread_userdata* userdata) {
 		while (userdata->current_time < target_time) {
 			lua_pushnumber(L,userdata->current_time);
 			lua_setglobal(L,"CurrentTime");
-
-			//Perform data exchange
-			SIMC_Lock_Enter(userdata->readWriteLock);
-				lua_getglobal(L,"DataExchange");
-				lua_pushstring(L,userdata->writeData);
-				if (lua_pcall(L,1,1,0)) {
-					lua_pushcfunction(L,shared_print);
-					lua_pushvalue(L,-2);
-					lua_call(L,1,0);
-					lua_pop(L,1);
-				}
-				if (lua_tostring(L,-1)) {
-					//userdata->readData[0] = 0; //This avoid overspam of messages
-					if (((BUFFER_SIZE-1)-strlen(userdata->readData)) > strlen(lua_tostring(L,-1))) {
-						strncat(userdata->readData,lua_tostring(L,-1),(BUFFER_SIZE-1) - strlen(lua_tostring(L,-1)));
-					}
-				} 
-				lua_pop(L,1);
-				userdata->writeData[0] = 0;
-			SIMC_Lock_Leave(userdata->readWriteLock);
-
+			
 			//Execute think
 			lua_getglobal(L,"Think");
 			if (lua_pcall(L,0,0,0)) {
@@ -174,7 +213,7 @@ int API_InitializeTrain(lua_State* state) {
 	//if (!LUA->CheckType(1, Type::USERDATA)) return 0;'
 
 	//Add entry for train
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+	/*LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1,"Turbostroi");
 	LUA->GetField(-1,"TrainData");
 	LUA->Push(1);
@@ -182,7 +221,7 @@ int API_InitializeTrain(lua_State* state) {
 	LUA->SetTable(-3);
 	LUA->Pop(); //TrainData
 	LUA->Pop(); //Turbostroi
-	LUA->Pop(); //GLOB
+	LUA->Pop(); //GLOB*/
 
 	//Initialize LuaJIT for train
 	lua_State* L  = luaL_newstate();
@@ -192,6 +231,10 @@ int API_InitializeTrain(lua_State* state) {
 	lua_setglobal(L,"TURBOSTROI");
 	lua_pushcfunction(L,shared_print);
 	lua_setglobal(L,"print");
+	lua_pushcfunction(L,thread_sendmessage);
+	lua_setglobal(L,"SendMessage");
+	lua_pushcfunction(L,thread_recvmessage);
+	lua_setglobal(L,"RecvMessage");
 
 	//Load neccessary files
 	loadLua(state,L,"metrostroi/sv_turbostroi.lua");
@@ -238,11 +281,12 @@ int API_InitializeTrain(lua_State* state) {
 	thread_userdata* userdata = (thread_userdata*)malloc(sizeof(thread_userdata));
 	userdata->finished = 0;
 	userdata->L = L;
-	userdata->readData[0] = 0;
-	userdata->writeData[0] = 0;
-	userdata->readWriteLock = SIMC_Lock_Create();
+	SIMC_Queue_Create(&userdata->thread_to_sim,QUEUE_SIZE,sizeof(thread_msg));
+	SIMC_Queue_Create(&userdata->sim_to_thread,QUEUE_SIZE,sizeof(thread_msg));
 	LUA->PushUserdata(userdata);
 	LUA->SetField(1,"_sim_userdata");
+	lua_pushlightuserdata(L,userdata);
+	lua_setglobal(L,"_userdata");
 
 	//Create thread for simulation
 	SIMC_THREAD_ID thread = SIMC_Thread_Create(threadSimulation,userdata);
@@ -259,7 +303,7 @@ int API_DeinitializeTrain(lua_State* state) {
 	LUA->SetField(1,"_sim_userdata");
 
 	//Remove entry for train
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+	/*LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1,"Turbostroi");
 	LUA->GetField(-1,"TrainData");
 	LUA->Push(1);
@@ -267,18 +311,18 @@ int API_DeinitializeTrain(lua_State* state) {
 	LUA->SetTable(-3);
 	LUA->Pop(); //TrainData
 	LUA->Pop(); //Turbostroi
-	LUA->Pop(); //GLOB
+	LUA->Pop(); //GLOB*/
 	return 0;
 }
 
 int API_LoadSystem(lua_State* state) {
-	char msg[8192] = { 0 };
-	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
-	LUA->GetField(-1,"Msg");
-	sprintf(msg,"Metrostroi: Loading system %s [%s]\n",LUA->GetString(1),LUA->GetString(2));
-	LUA->PushString(msg);
-	LUA->Call(1,0);
-	LUA->Pop();
+	//char msg[8192] = { 0 };
+	//LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
+	//LUA->GetField(-1,"Msg");
+	//sprintf(msg,"Metrostroi: Loading system %s [%s]\n",LUA->GetString(1),LUA->GetString(2));
+	//LUA->PushString(msg);
+	//LUA->Call(1,0);
+	//LUA->Pop();
 
 	strncat(loadSystemsList,LUA->GetString(1),131071);
 	strncat(loadSystemsList,"\n",131071);
@@ -324,28 +368,50 @@ int API_Think(lua_State* state) {
 	return 0;
 }
 
-int API_ExchangeData(lua_State* state) {
-	LUA->CheckType(2,Type::STRING);
+int API_SendMessage(lua_State* state) {
+	LUA->CheckType(2,Type::NUMBER);
+	LUA->CheckType(3,Type::STRING);
+	LUA->CheckType(4,Type::STRING);
+	LUA->CheckType(5,Type::NUMBER);
+	LUA->CheckType(6,Type::NUMBER);
 
 	LUA->GetField(1,"_sim_userdata");
 	thread_userdata* userdata = (thread_userdata*)LUA->GetUserdata(-1);
 	LUA->Pop();
 
 	if (userdata) {
-		SIMC_Lock_Enter(userdata->readWriteLock);
-			//if ((131000-strlen(userdata->writeData)) > strlen(LUA->GetString(2))) {
-				//strncat(userdata->writeData,LUA->GetString(2),131071);
-			//}
-			if (((BUFFER_SIZE-1)-strlen(userdata->writeData)) > strlen(LUA->GetString(2))) {
-				strncat(userdata->writeData,LUA->GetString(2),(BUFFER_SIZE-1) - strlen(LUA->GetString(2)));
-			}
-			LUA->PushString(userdata->readData);
-			userdata->readData[0] = 0;
-		SIMC_Lock_Leave(userdata->readWriteLock);
-	} else {
-		LUA->PushString("");
+		thread_msg* tmsg;
+		SIMC_Queue_EnterWrite(userdata->sim_to_thread,(void**)&tmsg);
+			tmsg->message = (int)LUA->GetNumber(2);
+			strncpy(tmsg->system_name,LUA->GetString(3),63);
+			tmsg->system_name[63] = 0;
+			strncpy(tmsg->name,LUA->GetString(4),63);
+			tmsg->name[63] = 0;
+			tmsg->index = LUA->GetNumber(5);
+			tmsg->value = LUA->GetNumber(6);
+		SIMC_Queue_LeaveWrite(userdata->sim_to_thread);
 	}
-	return 1;
+	return 0;
+}
+
+int API_RecvMessage(lua_State* state) {
+	LUA->GetField(1,"_sim_userdata");
+	thread_userdata* userdata = (thread_userdata*)LUA->GetUserdata(-1);
+	LUA->Pop();
+
+	if (userdata) {
+		thread_msg* tmsg;
+		if (SIMC_Queue_EnterRead(userdata->thread_to_sim,(void**)&tmsg)) {
+			LUA->PushNumber(tmsg->message);
+			LUA->PushString(tmsg->system_name);
+			LUA->PushString(tmsg->name);
+			LUA->PushNumber(tmsg->index);
+			LUA->PushNumber(tmsg->value);
+			SIMC_Queue_LeaveRead(userdata->thread_to_sim);
+			return 5;
+		}		
+	}
+	return 0;
 }
 
 int API_SetSimulationFPS(lua_State* state) {
@@ -374,7 +440,7 @@ GMOD_MODULE_OPEN() {
 		LUA->Call(1,0);
 		return 0;
 	}
-	LUA->Pop();
+	LUA->Pop(); //SERVER
 
 	//Check for global table
 	LUA->GetField(-1,"Metrostroi");
@@ -384,7 +450,7 @@ GMOD_MODULE_OPEN() {
 		LUA->Call(1,0);
 		return 0;
 	}
-	LUA->Pop();
+	LUA->Pop(); //Metrostroi
 
 	//Initialize threading
 	SIMC_Thread_Initialize();
@@ -398,8 +464,10 @@ GMOD_MODULE_OPEN() {
 	LUA->SetField(-2,"DeinitializeTrain");
 	LUA->PushCFunction(API_Think);
 	LUA->SetField(-2,"Think");
-	LUA->PushCFunction(API_ExchangeData);
-	LUA->SetField(-2,"ExchangeData");
+	LUA->PushCFunction(API_SendMessage);
+	LUA->SetField(-2,"SendMessage");
+	LUA->PushCFunction(API_RecvMessage);
+	LUA->SetField(-2,"RecvMessage");
 	LUA->PushCFunction(API_LoadSystem);
 	LUA->SetField(-2,"LoadSystem");
 	LUA->PushCFunction(API_RegisterSystem);
@@ -408,9 +476,6 @@ GMOD_MODULE_OPEN() {
 	LUA->SetField(-2,"SetSimulationFPS");
 	LUA->PushCFunction(API_SetTargetTime);
 	LUA->SetField(-2,"SetTargetTime");
-
-	LUA->CreateTable();
-	LUA->SetField(-2,"TrainData");
 
 	LUA->SetField(-2,"Turbostroi");
 
