@@ -159,6 +159,8 @@ void threadSimulation(thread_userdata* userdata) {
 	lua_pushstring(L,"[!] Terminating thread");
 	lua_call(L,1,0);
 	lua_close(L);
+	SIMC_Queue_Destroy(userdata->sim_to_thread);
+	SIMC_Queue_Destroy(userdata->thread_to_sim);
 	free(userdata);
 }
 
